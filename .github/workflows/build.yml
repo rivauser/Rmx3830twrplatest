@@ -1,0 +1,95 @@
+name: Build TWRP RMX3830
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: "TWRP minimal manifest URL"
+        default: "https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp"
+      manifest_branch:
+        description: "Manifest branch (twrp-12.1 is the safest; try others if it fails)"
+        default: "twrp-12.1"
+      device_zip:
+        description: "Device tree zip uploaded in the repo root"
+        default: "device_realme_RMX3830_draft.zip"
+      device_name:
+        description: "Device codename"
+        default: "RMX3830"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout repo (to get the device tree zip)
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install build packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+            libc6-dev-i386 libncurses5 lib32ncurses-dev x11proto-core-dev libx11-dev lib32z1-dev \
+            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig python3 python-is-python3 \
+            bc lz4 cpio rsync ccache openjdk-11-jdk
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Set up git
+        run: |
+          git config --global user.name "builder"
+          git config --global user.email "builder@example.com"
+          git config --global color.ui false
+
+      - name: Sync TWRP source
+        run: |
+          mkdir -p ~/twrp && cd ~/twrp
+          repo init --depth=1 -u "${{ github.event.inputs.manifest_url }}" -b "${{ github.event.inputs.manifest_branch }}"
+          repo sync -c -j4 --force-sync --no-clone-bundle --no-tags
+          df -h /
+
+      - name: Add device tree
+        run: |
+          mkdir -p /tmp/dt
+          unzip -q "$GITHUB_WORKSPACE/${{ github.event.inputs.device_zip }}" -d /tmp/dt
+          SRC=$(find /tmp/dt -name BoardConfig.mk -printf '%h\n' | head -n1)
+          echo "Device tree found at: $SRC"
+          mkdir -p ~/twrp/device/realme
+          rm -rf ~/twrp/device/realme/${{ github.event.inputs.device_name }}
+          cp -r "$SRC" ~/twrp/device/realme/${{ github.event.inputs.device_name }}
+          ls ~/twrp/device/realme/${{ github.event.inputs.device_name }}
+
+      - name: Build vendor_boot
+        run: |
+          cd ~/twrp
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export LC_ALL=C
+          set +e
+          source build/envsetup.sh
+          lunch twrp_${{ github.event.inputs.device_name }}-eng
+          mka -j$(nproc --all) vendorbootimage 2>&1 | tee ~/build.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Collect output
+        if: always()
+        run: |
+          mkdir -p ~/out
+          cp ~/twrp/out/target/product/*/vendor_boot.img ~/out/ 2>/dev/null || true
+          cp ~/twrp/out/target/product/*/recovery.img ~/out/ 2>/dev/null || true
+          tail -n 300 ~/build.log > ~/out/build_log_tail.txt 2>/dev/null || true
+          ls -la ~/out
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: twrp-${{ github.event.inputs.device_name }}
+          path: ~/out/*
+          if-no-files-found: warn
